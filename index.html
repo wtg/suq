@@ -203,10 +203,15 @@
 
   <script>
     // --- State ---
-    let speakCounts = new Map();
-    let queueStack = [{ label: 'Main', queue: [] }];
+    // Each level keeps its own speak counts, so subqueues start fresh.
+    let queueStack = [newLevel('Main')];
     let currentSpeaker = null;
+    let currentLevel = 0; // index of the level currentSpeaker was drawn from
     let undoStack = [];
+
+    function newLevel(label) {
+      return { label, queue: [], counts: {} };
+    }
 
     // --- Stopwatch ---
     let speakerStartTime = null;
@@ -243,9 +248,9 @@
     // --- Persistence ---
     function saveState() {
       localStorage.setItem('suq-state', JSON.stringify({
-        speakCounts: Array.from(speakCounts.entries()),
         queueStack,
         currentSpeaker,
+        currentLevel,
       }));
     }
 
@@ -254,18 +259,21 @@
         const raw = localStorage.getItem('suq-state');
         if (!raw) return;
         const s = JSON.parse(raw);
-        speakCounts = new Map(s.speakCounts);
-        queueStack = s.queueStack || [{ label: 'Main', queue: [] }];
+        queueStack = s.queueStack || [newLevel('Main')];
+        for (const l of queueStack) l.counts = l.counts || {};
+        // Older saves kept a single global count list; it belongs to Main.
+        if (s.speakCounts) queueStack[0].counts = Object.fromEntries(s.speakCounts);
         currentSpeaker = s.currentSpeaker || null;
+        currentLevel = s.currentLevel ?? queueStack.length - 1;
       } catch { /* start fresh */ }
     }
 
     // --- Undo ---
     function snapshot() {
       return {
-        speakCounts: new Map(speakCounts),
-        queueStack: queueStack.map(l => ({ label: l.label, queue: [...l.queue] })),
+        queueStack: queueStack.map(l => ({ label: l.label, queue: [...l.queue], counts: { ...l.counts } })),
         currentSpeaker,
+        currentLevel,
       };
     }
 
@@ -278,9 +286,9 @@
       if (undoStack.length === 0) return;
       const prev = undoStack.pop();
       const hadSpeaker = currentSpeaker;
-      speakCounts = prev.speakCounts;
       queueStack = prev.queueStack;
       currentSpeaker = prev.currentSpeaker;
+      currentLevel = prev.currentLevel;
       // Restart stopwatch if speaker changed
       if (currentSpeaker !== hadSpeaker) {
         if (currentSpeaker) startStopwatch(); else stopStopwatch();
@@ -294,19 +302,27 @@
       return queueStack[queueStack.length - 1];
     }
 
-    function getCount(name) {
-      return speakCounts.get(name) || 0;
+    function getCount(name, level = activeLevel()) {
+      return level.counts[name] || 0;
+    }
+
+    // Every name seen at any level, for autocomplete.
+    function allNames() {
+      const names = new Set();
+      for (const l of queueStack) for (const n in l.counts) names.add(n);
+      return Array.from(names);
     }
 
     // --- Queue operations ---
     function enqueue(name) {
-      const q = activeLevel().queue;
+      const level = activeLevel();
+      const q = level.queue;
       if (q.includes(name)) return;
       if (name === currentSpeaker) return;
 
       pushUndo();
 
-      if (!speakCounts.has(name)) speakCounts.set(name, 0);
+      if (!(name in level.counts)) level.counts[name] = 0;
 
       const count = getCount(name);
       let i = q.length;
@@ -324,13 +340,16 @@
     function advanceSpeaker() {
       pushUndo();
 
-      if (currentSpeaker !== null) {
-        speakCounts.set(currentSpeaker, getCount(currentSpeaker) + 1);
+      // Credit the speech to the level it was given on, if that level is still open
+      const spokeOn = queueStack[currentLevel];
+      if (currentSpeaker !== null && spokeOn) {
+        spokeOn.counts[currentSpeaker] = getCount(currentSpeaker, spokeOn) + 1;
       }
 
       const q = activeLevel().queue;
       if (q.length > 0) {
         currentSpeaker = q.shift();
+        currentLevel = queueStack.length - 1;
         startStopwatch();
       } else {
         currentSpeaker = null;
@@ -345,7 +364,7 @@
     function openSubqueue() {
       pushUndo();
       const depth = queueStack.length;
-      queueStack.push({ label: 'Subsidiary motion ' + depth, queue: [] });
+      queueStack.push(newLevel('Subsidiary motion ' + depth));
       saveState();
       render();
     }
@@ -372,7 +391,7 @@
       }
 
       const query = value.toLowerCase();
-      acResults = Array.from(speakCounts.keys())
+      acResults = allNames()
         .filter(name => name.toLowerCase().includes(query))
         .sort((a, b) => {
           const aStarts = a.toLowerCase().startsWith(query) ? 0 : 1;
@@ -448,7 +467,7 @@
           : level.queue.map((name, i) =>
               `<div class="queue-item">
                 <span>${i + 1}. ${escapeHtml(name)}</span>
-                <span class="speak-count">${getCount(name)} prior</span>
+                <span class="speak-count">${getCount(name, level)} prior</span>
               </div>`
             ).join('');
         return `<div class="queue-level${isActive ? ' active' : ''}">
@@ -461,9 +480,10 @@
       }).join('');
 
       // Footer
+      const counts = Object.values(activeLevel().counts);
       document.getElementById('total-speakers').textContent =
-        `${speakCounts.size} speaker${speakCounts.size !== 1 ? 's' : ''}`;
-      const total = Array.from(speakCounts.values()).reduce((a, b) => a + b, 0);
+        `${counts.length} speaker${counts.length !== 1 ? 's' : ''}`;
+      const total = counts.reduce((a, b) => a + b, 0);
       document.getElementById('total-speeches').textContent =
         `${total} speech${total !== 1 ? 'es' : ''}`;
     }
@@ -478,9 +498,9 @@
     }
     function confirmReset() {
       pushUndo();
-      speakCounts.clear();
-      queueStack = [{ label: 'Main', queue: [] }];
+      queueStack = [newLevel('Main')];
       currentSpeaker = null;
+      currentLevel = 0;
       stopStopwatch();
       saveState();
       render();
